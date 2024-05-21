@@ -1,0 +1,248 @@
+---
+title: "Exercise4"
+format: html
+editor: visual
+---
+
+## Demo
+
+```{r}
+library("readr")
+library("dplyr")
+library("sf")
+library("ggplot2")
+
+wildschwein <- read_delim("wildschwein_BE_2056.csv", ",")
+
+# Careful! What Timezone is assumed?
+#transform into an sf object filter Sabi
+sabi <- wildschwein |>
+    st_as_sf(coords = c("E", "N"), crs = 2056, remove = FALSE) |>
+    filter(TierName == "Sabi", DatetimeUTC >= "2015-07-01", DatetimeUTC < "2015-07-03")
+
+```
+
+```{r}
+ggplot(sabi, aes(E, N, color=DatetimeUTC)) +
+  geom_point() +
+  geom_path() +
+  coord_fixed() +
+  scale_color_datetime(low = "blue", high= "red") +
+  guides(color= guide_colorbar(title.position = "top")) +
+  geom_point(y=1205120, x= 2570470, size= 20)
+```
+
+Step a/b)
+
+```{r}
+distance_by_element <- function(later, now) {
+  as.numeric(
+    st_distance(later, now, by_element = TRUE)
+  )
+}
+
+# create new coloum for each offset
+sabi <- sabi |>
+    mutate(
+        nMinus2 = distance_by_element(lag(geometry, 2), geometry),  # distance to pos -30 minutes
+        nMinus1 = distance_by_element(lag(geometry, 1), geometry),  # distance to pos -15 minutes
+        nPlus1  = distance_by_element(geometry, lead(geometry, 1)), # distance to pos +15 mintues
+        nPlus2  = distance_by_element(geometry, lead(geometry, 2))  # distance to pos +30 minutes
+    )
+
+View(sabi)
+# calculate mean distance per row of nminus 2, nminus1
+sabi <- sabi |>
+    rowwise() |>
+    mutate(
+        stepMean = mean(c(nMinus2, nMinus1, nPlus1, nPlus2))
+    ) |>
+    ungroup()
+
+View(sabi)
+
+
+#step c) remove static points here: treshhold is our mean distance
+sabi <- sabi |>
+    mutate(static = stepMean < mean(stepMean, na.rm = TRUE))
+
+sabi_filter <- sabi |>
+    filter(!static)
+
+sabi_filter |>
+    ggplot(aes(E, N)) +
+    geom_path() +
+    geom_point() +
+    coord_fixed() +
+    theme(legend.position = "bottom")
+
+# shows where the animal was not static, = moving.
+```
+
+# My own movement data
+
+## Preperation
+
+```{r}
+library("readr")
+library("sf")
+library("tmap")
+
+data <- read_delim("data/posmo_2024-04-06T00_00_00+02_00-2024-05-03T23_59_59+02_00.csv", ",")
+
+data <- st_as_sf(data, coords = c("lon_x", "lat_y"), crs = 4326)
+
+st_crs(data)
+
+data <- st_transform(data, crs = st_crs("+init=epsg:2056"))
+
+View(data)
+
+data_line <- data |> 
+  # dissolve to a MULTIPOINT:
+  summarise(do_union = FALSE) |> 
+  st_cast("LINESTRING")
+
+tmap_options(basemaps = "OpenStreetMap")
+
+tm_shape(data_line) +
+  tm_lines() +
+  tm_shape(data) + 
+  tm_dots()
+
+data_coord <- st_coordinates(data)
+data_mit_coord <- cbind(data, data_coord)
+View(data_mit_coord)
+```
+
+filter one day
+
+```{r}
+oneday <- filter(data_mit_coord, datetime >= "2024-05-01 00:00:00", datetime < "2024-05-01 23:59:59")
+View(oneday)
+
+```
+
+### Task 1: Segmentation
+
+Step a/b)
+Posmo took my location every 10-15 seconds. However, the time interval is not always the same.
+I choose as the temporal window 60 seconds. That would mean including 6 fixes.
+```{r}
+distance_by_element <- function(later, now) {
+  as.numeric(
+    st_distance(later, now, by_element = TRUE)
+  )
+}
+
+oneday <- oneday |>
+    mutate(
+      nMinus3 = distance_by_element(lag(geometry, 3), geometry), # distance to pos -30 seconds
+        nMinus2 = distance_by_element(lag(geometry, 2), geometry),  # distance to pos -20 seconds
+        nMinus1 = distance_by_element(lag(geometry, 1), geometry),  # distance to pos -10 seconds
+        nPlus1  = distance_by_element(geometry, lead(geometry, 1)), # distance to pos +10 seconds
+        nPlus2  = distance_by_element(geometry, lead(geometry, 2)),  # distance to pos +20 seconds
+      nPlus3  = distance_by_element(geometry, lead(geometry, 3)) # distance to pos +30 seconds
+    )
+
+
+# for each row we want mean distance of nminus3, minus2 etc.
+oneday <- oneday |>
+    rowwise() |>
+    mutate(
+        stepMean = mean(c(nMinus3, nMinus2, nMinus1, nPlus1, nPlus2, nPlus3))
+    ) |>
+    ungroup()
+
+View(oneday)
+```
+
+### Task 2: Specify and apply threshold d
+```{r}
+# remove static points
+# finding the threshold:
+summary(oneday)
+
+oneday <- oneday |>
+    mutate(static = stepMean < mean(stepMean, na.rm = TRUE))
+
+```
+
+
+### Task 3: Visualize segmented trajectories
+```{r}
+oneday |>
+    ggplot(aes(X, Y, colour = static)) +
+    geom_path() +
+    geom_point() +
+    coord_equal() +
+    theme(legend.position = "bottom")
+```
+
+
+### Task 4: Segment-based analysis
+```{r}
+rle_id <- function(vec) {
+    x <- rle(vec)$lengths
+    as.factor(rep(seq_along(x), times = x))
+}
+
+oneday <- oneday |>
+    mutate(segment_id = rle_id(static))
+```
+
+
+### Task 5: Similarity measures
+```{r}
+pedest <- read_delim("pedestrian.csv")
+View(pedest)
+head(pedest)
+str(pedest)
+
+# Visualisieren der Trajektorien
+ggplot(pedest, aes(x = E, y = N, color = factor(TrajID))) +
+  facet_wrap(~ TrajID) +
+  geom_path() +
+  labs(title = "Fußgänger-Trajektorien",
+       x = "X-Koordinate",
+       y = "Y-Koordinate",
+       color = "Fußgänger ID") +
+  theme_minimal()
+```
+
+
+### Task 6: Calculate similarity
+```{r}
+install.packages("SimilarityMeasures")
+library("SimilarityMeasures")
+help(package = "SimilarityMeasures")
+
+#make matrices
+trajectory_1 <- as.matrix(subset(pedest, TrajID == 1)[, c("E", "N")])
+
+similarity_results <- matrix(NA, nrow = 4, ncol = 5, dimnames = list(c("DTW", "EditDist", "Frechet", "LCSS"), paste("Traj_", 2:6, sep = "")))
+
+for (i in 2:6) {
+      trajectory_i <- as.matrix(subset(pedest, TrajID == i)[, c("E", "N")])
+      similarity_results["DTW", paste("Traj_", i, sep = "")] <- DTW(trajectory_1, trajectory_i)
+      similarity_results["EditDist", paste("Traj_", i, sep = "")] <- EditDist(trajectory_1, trajectory_i)
+      similarity_results["Frechet", paste("Traj_", i, sep = "")] <- Frechet(trajectory_1, trajectory_i)
+      similarity_results["LCSS", paste("Traj_", i, sep = "")] <- LCSS(trajectory_1, trajectory_i, pointSpacing = 1, pointDistance = 0.5, errorMarg = 0.1)
+}
+
+print(similarity_results)
+
+# Visualisierung
+library("reshape2")
+# zuerst Matrix in langes Format machen für gg plot
+similarity_results_df <- as.data.frame(similarity_results)
+similarity_results_df$Measure <- rownames(similarity_results_df)
+similarity_results_long <- melt(similarity_results_df, id.vars = "Measure")  
+
+ggplot(similarity_results_long, aes(x = variable, y = value, fill = Measure)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  facet_wrap(~ Measure, scales = "free_y") +
+  labs(title = "Ähnlichkeitsmasse zwischen Trajektorie 1 und Trajektorien 2-6", x = "Vergleich Trajektorie", y = "Ähnlichkeitswert") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    ```
